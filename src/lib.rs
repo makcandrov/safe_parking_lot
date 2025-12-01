@@ -1,176 +1,219 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![doc = include_str!("../README.md")]
 
-use std::ops::Deref;
+use ::core::{convert::Infallible, ops::Deref};
 
-use parking_lot::{MappedRwLockWriteGuard, RwLock, RwLockWriteGuard};
+#[cfg(feature = "parking_lot")]
+pub mod parking_lot;
+#[cfg(feature = "std")]
+pub mod std;
 
-/// A borrow-checker–friendly wrapper around `parking_lot::RwLock`.
+/// A wrapper around a lock type `L` that ensures safe locking behavior.
 ///
-/// `SafeRwLock` represents access to an `RwLock` in a way that enforces:
-///
-/// - You may lock and inspect the value.
-/// - You may not mutate until you explicitly request a writable guard.
-/// - Unlocking returns you to a clean state that must be re-locked.
-///
-/// This helps ensure that conditional write logic is expressed correctly,
-/// especially inside loops or retry patterns.
+/// The `SafeLock` type provides methods for acquiring and releasing locks while
+/// enforcing safety against common locking mistakes like attempting to mutate data
+/// before confirming conditions or improperly handling the lock state across retries.
 #[derive(Debug)]
-pub struct SafeRwLock<'a, T>(&'a RwLock<T>);
+pub struct SafeLock<L>(L);
 
-/// A temporary write-lock holder that allows **inspection only**.
+/// A guard for a lock type `L` that holds the lock and allows inspection of the
+/// data through a guard type `G`. The guard prevents mutation until explicitly upgraded.
 ///
-/// After calling [`SafeRwLock::lock`], you receive a `SafeRwLockGuard`.
-/// This guard allows read-only access to the data. To proceed, you must
-/// choose one of two actions:
-///
-/// - [`unlock`](Self::unlock): release the lock and regain a `SafeRwLock`, or
-/// - [`upgrade`](Self::upgrade): convert into a full `RwLockWriteGuard`
-///   allowing mutation.
-///
-/// By separating inspection from mutation, the compiler can enforce that
-/// no modification happens before you explicitly upgrade.
+/// This guard ensures that mutation is performed only after explicitly upgrading the lock.
 #[derive(Debug)]
-pub struct SafeRwLockGuard<'a, T> {
-    lock: SafeRwLock<'a, T>,
-    guard: RwLockWriteGuard<'a, T>,
+pub struct SafeGuard<L, G> {
+    lock: SafeLock<L>,
+    guard: G,
 }
 
-/// A temporary write-lock holder that allows **inspection only** on a mapped view of the data.
+/// Trait for locks that support blocking behavior.
 ///
-/// After calling [`SafeRwLockGuard::map`], you receive a `SafeMappedRwLockGuard`.
-/// This guard allows read-only access to a mapped view of the data. To proceed, you must
-/// choose one of two actions:
-///
-/// - [`unlock`](Self::unlock): release the lock and regain a `SafeRwLock`, or
-/// - [`upgrade`](Self::upgrade): convert into a full `MappedRwLockWriteGuard`
-///   allowing mutation of the mapped data.
-///
-/// By separating inspection from mutation, the compiler can enforce that no modification
-/// happens before you explicitly upgrade.
-#[derive(Debug)]
-pub struct SafeMappedRwLockGuard<'a, T, U> {
-    lock: SafeRwLock<'a, T>,
-    guard: MappedRwLockWriteGuard<'a, U>,
-}
+/// This trait provides a method to acquire the lock in a blocking manner and returns
+/// a guard to access the locked data. It is intended for types of locks that block
+/// the current thread until the lock becomes available.
+pub trait LockBlocking {
+    type Error;
+    type Guard;
 
-impl<'a, T> SafeRwLock<'a, T> {
-    /// Creates a new [`SafeRwLock`](SafeRwLock) referencing the given [`RwLock`](RwLock).
+    /// Blocks the current thread until the lock can be acquired.
     ///
-    /// This does not lock the underlying [`RwLock`](RwLock).
-    pub fn new(lock: &'a RwLock<T>) -> Self {
+    /// Returns a guard that allows access to the data protected by the lock.
+    fn lock_blocking(&self) -> Result<Self::Guard, Self::Error>;
+}
+
+/// Trait for locks that support immediate locking without blocking.
+///
+/// This trait provides a method to try to acquire the lock without blocking.
+pub trait LockImmediate {
+    type Error;
+    type Guard;
+
+    /// Attempts to acquire the lock immediately, without blocking.
+    ///
+    /// Returns a guard if successful, or an error if the lock is unavailable.
+    fn lock_immediate(&self) -> Result<Self::Guard, Self::Error>;
+}
+
+impl<L> SafeLock<L> {
+    /// Creates a new [`SafeLock`] wrapping the provided lock.
+    ///
+    /// This does not acquire the lock; it only wraps the lock into a [`SafeLock`] type.
+    pub const fn new(lock: L) -> Self {
         Self(lock)
     }
 
-    /// Acquires a write lock and returns a guard that allows inspection
-    /// but not yet mutation.
+    /// Acquires the lock in write mode and returns a guard for the locked data.
     ///
-    /// To modify the value, you must call [`SafeRwLockGuard::upgrade`].
-    pub fn lock(self) -> SafeRwLockGuard<'a, T> {
-        SafeRwLockGuard {
-            guard: self.0.write(),
+    /// The lock is acquired in **write mode**, and the returned guard allows read-only access to the data.
+    /// Mutation is not possible until explicitly upgrading the guard.
+    pub fn lock_blocking(self) -> SafeGuard<L, L::Guard>
+    where
+        L: LockBlocking<Error = Infallible>,
+    {
+        SafeGuard {
+            guard: LockBlocking::lock_blocking(&self.0).unwrap(),
             lock: self,
         }
     }
 
-    /// Attempts to acquire a write lock.
+    /// Attempts to acquire the lock in write mode and returns a guard if successful.
     ///
-    /// Returns:
-    /// - `Ok(SafeRwLockGuard)` if successful,
-    /// - `Err(self)` if the lock is currently held by another thread.
-    pub fn try_lock(self) -> Result<SafeRwLockGuard<'a, T>, Self> {
-        match self.0.try_write() {
-            Some(guard) => Ok(SafeRwLockGuard { guard, lock: self }),
-            None => Err(self),
+    /// The lock is acquired in **write mode**. If the lock is already held, this method will return `Err(self)`.
+    pub fn try_lock_blocking(self) -> Result<SafeGuard<L, L::Guard>, Self>
+    where
+        L: LockBlocking,
+    {
+        match LockBlocking::lock_blocking(&self.0) {
+            Ok(guard) => Ok(SafeGuard { lock: self, guard }),
+            Err(_) => Err(self),
+        }
+    }
+
+    /// Attempts to acquire the lock in write mode and returns an error if it fails.
+    ///
+    /// The lock is acquired in **write mode**, and the method returns an error if the lock is unavailable.
+    pub fn try_lock_blocking_err(self) -> Result<SafeGuard<L, L::Guard>, (Self, L::Error)>
+    where
+        L: LockBlocking,
+    {
+        match LockBlocking::lock_blocking(&self.0) {
+            Ok(guard) => Ok(SafeGuard { lock: self, guard }),
+            Err(err) => Err((self, err)),
+        }
+    }
+
+    /// Acquires the lock in write mode without blocking and returns a guard.
+    ///
+    /// This method tries to acquire the lock in **write mode** without blocking the current thread.
+    /// The lock is either acquired successfully or the method returns an error.
+    pub fn lock_immediate(self) -> SafeGuard<L, L::Guard>
+    where
+        L: LockImmediate<Error = Infallible>,
+    {
+        SafeGuard {
+            guard: LockImmediate::lock_immediate(&self.0).unwrap(),
+            lock: self,
+        }
+    }
+
+    /// Attempts to acquire the lock in write mode without blocking and returns a guard if successful.
+    ///
+    /// If the lock is already held, this method will return `Err(self)` without blocking.
+    pub fn try_lock_immediate(self) -> Result<SafeGuard<L, L::Guard>, Self>
+    where
+        L: LockImmediate,
+    {
+        match LockImmediate::lock_immediate(&self.0) {
+            Ok(guard) => Ok(SafeGuard { lock: self, guard }),
+            Err(_) => Err(self),
+        }
+    }
+
+    /// Attempts to acquire the lock in write mode immediately and returns an error if unsuccessful.
+    pub fn try_lock_immediate_err(self) -> Result<SafeGuard<L, L::Guard>, (Self, L::Error)>
+    where
+        L: LockImmediate,
+    {
+        match LockImmediate::lock_immediate(&self.0) {
+            Ok(guard) => Ok(SafeGuard { lock: self, guard }),
+            Err(err) => Err((self, err)),
         }
     }
 }
 
-impl<'a, T> SafeRwLockGuard<'a, T> {
-    /// Converts this guard into a real write guard, enabling mutation.
+impl<L, G> SafeGuard<L, G> {
+    /// Upgrades the `SafeGuard` to the underlying guard, allowing mutation of the locked data.
     ///
-    /// After upgrading, you work directly with the underlying
-    /// `RwLockWriteGuard`, and normal drop semantics apply.
-    pub fn upgrade(self) -> RwLockWriteGuard<'a, T> {
+    /// Even though the underlying lock was acquired in **write mode**, mutation of the data is only
+    /// possible after explicitly upgrading the guard. This ensures safety in concurrent code.
+    pub fn upgrade(self) -> G {
         self.guard
     }
 
-    /// Releases the lock and returns the original [`SafeRwLock`](SafeRwLock).
+    /// Releases the lock and returns the original [`SafeLock`], allowing further locking attempts.
     ///
-    /// This is typically used when a condition is not met and you want to
-    /// retry locking later without performing any mutation.
-    pub fn unlock(self) -> SafeRwLock<'a, T> {
+    /// This method is useful when retrying to acquire the lock under certain conditions.
+    pub fn unlock(self) -> SafeLock<L> {
         self.lock
     }
 
-    /// Maps the guarded value to a different type and returns a new guard for that type.
+    /// Maps the guarded value to a different type, returning a new guard for the mapped data.
     ///
-    /// This function allows you to create a mapped view of the data protected by the lock.
-    /// You can then access the mapped data immutably. To mutate it, you would need to call
-    /// the [`upgrade`](Self::upgrade) method to convert to a full write guard.
-    pub fn map<U, F>(self, f: F) -> SafeMappedRwLockGuard<'a, T, U>
+    /// The function `f` is applied to the underlying guard, transforming it into a new guard
+    /// with the mapped data. The lock remains in write mode until the guard is explicitly upgraded.
+    pub fn map_guard<F, H>(self, f: F) -> SafeGuard<L, H>
     where
-        F: FnOnce(&mut T) -> &mut U,
+        F: FnOnce(G) -> H,
     {
-        SafeMappedRwLockGuard {
+        SafeGuard {
             lock: self.lock,
-            guard: RwLockWriteGuard::map(self.guard, f),
+            guard: f(self.guard),
         }
     }
 
-    /// Attempts to map the guarded value to a different type, returning a guard for the mapped data.
-    ///
-    /// This method works similarly to `map`, but with an additional check: it attempts to map the
-    /// value only if the mapping function returns `Some`. If the mapping function returns `None`,
-    /// the operation fails, and no mapping occurs. This provides more control when mapping is conditional.
-    pub fn try_map<U, F>(self, f: F) -> Result<SafeMappedRwLockGuard<'a, T, U>, Self>
+    /// Attempts to map the guarded value to a different type, returning an error if the mapping fails.
+    pub fn try_map_guard<F, H>(self, f: F) -> Result<SafeGuard<L, H>, Self>
     where
-        F: FnOnce(&mut T) -> Option<&mut U>,
+        F: FnOnce(G) -> Result<H, G>,
     {
-        match RwLockWriteGuard::try_map(self.guard, f) {
-            Ok(guard) => Ok(SafeMappedRwLockGuard {
-                guard,
+        match f(self.guard) {
+            Ok(guard) => Ok(SafeGuard {
                 lock: self.lock,
-            }),
-            Err(guard) => Err(Self {
                 guard,
-                lock: self.lock,
             }),
+            Err(guard) => Err(SafeGuard {
+                lock: self.lock,
+                guard,
+            }),
+        }
+    }
+
+    /// Attempts to map the guarded value to a different type, returning an error with additional information if it fails.
+    pub fn try_map_guard_err<F, H, E>(self, f: F) -> Result<SafeGuard<L, H>, (Self, E)>
+    where
+        F: FnOnce(G) -> Result<H, (G, E)>,
+    {
+        match f(self.guard) {
+            Ok(guard) => Ok(SafeGuard {
+                lock: self.lock,
+                guard,
+            }),
+            Err((guard, err)) => Err((
+                SafeGuard {
+                    lock: self.lock,
+                    guard,
+                },
+                err,
+            )),
         }
     }
 }
 
-impl<'a, T, U> SafeMappedRwLockGuard<'a, T, U> {
-    /// Converts this guard into a real write guard, enabling mutation.
-    ///
-    /// After upgrading, you work directly with the underlying
-    /// `MappedRwLockWriteGuard`, and normal drop semantics apply.
-    pub fn upgrade(self) -> MappedRwLockWriteGuard<'a, U> {
-        self.guard
-    }
-
-    /// Releases the lock and returns the original [`SafeRwLock`](SafeRwLock).
-    ///
-    /// This is typically used when a condition is not met and you want to
-    /// retry locking later without performing any mutation.
-    pub fn unlock(self) -> SafeRwLock<'a, T> {
-        self.lock
-    }
-}
-
-impl<'a, T> Deref for SafeRwLockGuard<'a, T> {
+impl<L, G, T> Deref for SafeGuard<L, G>
+where
+    G: Deref<Target = T>,
+{
     type Target = T;
-
-    /// Provides read-only access to the underlying value.
-    ///
-    /// Mutation is only possible after calling [`upgrade`](Self::upgrade).
-    fn deref(&self) -> &Self::Target {
-        Deref::deref(&self.guard)
-    }
-}
-
-impl<'a, T, U> Deref for SafeMappedRwLockGuard<'a, T, U> {
-    type Target = U;
 
     /// Provides read-only access to the underlying value.
     ///

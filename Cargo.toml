@@ -1,14 +1,19 @@
 [package]
-name = "safe_parking_lot"
+name = "safe-lock"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 repository = "https://github.com/makcandrov/parking_lot_safe"
 homepage = "https://github.com/makcandrov/parking_lot_safe"
 documentation = "https://docs.rs/parking_lot_safe"
-description = "Ensure safe conditional writes of `parking_lot::RwLock`s at compile time."
+description = "Ensure safe conditional writes at compile time."
 license = "MIT OR Apache-2.0"
-keywords = ["safe", "rwlock"]
+keywords = ["safe", "lock"]
 
 [dependencies]
-parking_lot = "0.12"
+parking_lot = { version = "0.12", optional = true }
+
+[features]
+default = ["std"]
+std = []
+parking_lot = ["dep:parking_lot"]
